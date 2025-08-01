@@ -1384,39 +1384,117 @@ def get_security_stats():
         }
 
 def get_client_ip():
-    """Get client IP address from Streamlit session state or request"""
+    """Get client IP address from various sources"""
     try:
-        # Try to get IP from Streamlit session state
-        if hasattr(st, 'session_state') and 'client_ip' in st.session_state:
-            return st.session_state.client_ip
+        # Method 0: Check for configured production IP
+        import os
+        production_ip = os.environ.get('PRODUCTION_IP')
+        if production_ip and production_ip != '127.0.0.1':
+            return production_ip
         
-        # Try to get from request headers (if available)
-        if hasattr(st, 'request') and hasattr(st.request, 'headers'):
-            # Check common IP headers
-            for header in ['X-Forwarded-For', 'X-Real-IP', 'CF-Connecting-IP']:
-                if header in st.request.headers:
-                    ip = st.request.headers[header].split(',')[0].strip()
-                    if ip and ip != 'unknown':
-                        return ip
+        # Try to load from config file
+        try:
+            import json
+            with open('data/config/ip_config.json', 'r') as f:
+                config = json.load(f)
+                configured_ip = config.get('production_ip')
+                if configured_ip and configured_ip != '127.0.0.1':
+                    return configured_ip
+        except:
+            pass
+        
+        # Method 1: Try to get from Streamlit context (newer versions)
+        try:
+            from streamlit.web.server.websocket_headers import _get_websocket_headers
+            headers = _get_websocket_headers()
+            if headers:
+                # Check for forwarded IP headers (production/proxy)
+                for header_name in ['x-forwarded-for', 'x-real-ip', 'cf-connecting-ip', 'x-client-ip']:
+                    if header_name in headers:
+                        ip = headers[header_name].split(',')[0].strip()
+                        if ip and ip != 'unknown' and not ip.startswith('127.'):
+                            return ip
+        except:
+            pass
+        
+        # Method 2: Try to get from environment variables (some deployments)
+        env_headers = ['HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR', 'HTTP_CF_CONNECTING_IP']
+        for header in env_headers:
+            env_ip = os.environ.get(header)
+            if env_ip and not env_ip.startswith('127.'):
+                return env_ip.split(',')[0].strip()
+        
+        # Method 3: Try to get external IP using a service (for production)
+        try:
+            import requests
+            import socket
             
-            # Fallback to remote address
-            if hasattr(st.request, 'remote_ip'):
-                return st.request.remote_ip
+            # Quick check if we're likely in production (not localhost)
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+            
+            if not local_ip.startswith('127.') and not local_ip.startswith('192.168.'):
+                # We're likely in production, try to get external IP
+                response = requests.get('https://httpbin.org/ip', timeout=3)
+                if response.status_code == 200:
+                    external_ip = response.json().get('origin', '').split(',')[0].strip()
+                    if external_ip and not external_ip.startswith('127.'):
+                        return external_ip
+        except:
+            pass
+        
+        # Method 4: Try to get from socket (local network IP)
+        try:
+            import socket
+            # Connect to a remote address to get local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            if local_ip and not local_ip.startswith('127.'):
+                return local_ip
+        except:
+            pass
         
         # Default fallback
         return "127.0.0.1"
-    except:
+    except Exception as e:
+        print(f"Error getting client IP: {e}")
         return "127.0.0.1"
 
 def get_user_agent():
-    """Get user agent from Streamlit request"""
+    """Get user agent from various sources"""
     try:
-        # Try to get from request headers
-        if hasattr(st, 'request') and hasattr(st.request, 'headers'):
-            if 'User-Agent' in st.request.headers:
-                return st.request.headers['User-Agent']
+        # Method 1: Try to get from Streamlit context
+        try:
+            from streamlit.web.server.websocket_headers import _get_websocket_headers
+            headers = _get_websocket_headers()
+            if headers and 'user-agent' in headers:
+                return headers['user-agent']
+        except:
+            pass
         
-        # Default fallback
+        # Method 2: Try to get from environment
+        import os
+        env_ua = os.environ.get('HTTP_USER_AGENT')
+        if env_ua:
+            return env_ua
+        
+        # Method 3: Try to detect browser from JavaScript (if available)
+        try:
+            # This would require custom JavaScript injection
+            # For now, we'll use a generic user agent
+            pass
+        except:
+            pass
+        
+        # Default fallback with more info
+        import platform
+        system_info = f"{platform.system()} {platform.release()}"
+        return f"Streamlit/1.0 ({system_info})"
+        
+    except Exception as e:
+        print(f"Error getting user agent: {e}")
         return "Streamlit/1.0"
     except:
         return "Streamlit/1.0"
