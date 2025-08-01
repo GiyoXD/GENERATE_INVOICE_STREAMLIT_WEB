@@ -1384,83 +1384,119 @@ def get_security_stats():
         }
 
 def get_client_ip():
-    """Get client IP address from various sources"""
+    """Get client IP address - simple and reliable"""
     try:
-        # Method 0: Check for configured production IP
+        # Method 1: Check for manually set real IP (for production)
+        if hasattr(st, 'session_state') and 'manual_real_ip' in st.session_state:
+            return st.session_state['manual_real_ip']
+        
+        # Method 2: Check environment variables (production deployments)
         import os
-        production_ip = os.environ.get('PRODUCTION_IP')
-        if production_ip and production_ip != '127.0.0.1':
-            return production_ip
-        
-        # Try to load from config file
-        try:
-            import json
-            with open('data/config/ip_config.json', 'r') as f:
-                config = json.load(f)
-                configured_ip = config.get('production_ip')
-                if configured_ip and configured_ip != '127.0.0.1':
-                    return configured_ip
-        except:
-            pass
-        
-        # Method 1: Try to get from Streamlit context (newer versions)
-        try:
-            from streamlit.web.server.websocket_headers import _get_websocket_headers
-            headers = _get_websocket_headers()
-            if headers:
-                # Check for forwarded IP headers (production/proxy)
-                for header_name in ['x-forwarded-for', 'x-real-ip', 'cf-connecting-ip', 'x-client-ip']:
-                    if header_name in headers:
-                        ip = headers[header_name].split(',')[0].strip()
-                        if ip and ip != 'unknown' and not ip.startswith('127.'):
-                            return ip
-        except:
-            pass
-        
-        # Method 2: Try to get from environment variables (some deployments)
-        env_headers = ['HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'REMOTE_ADDR', 'HTTP_CF_CONNECTING_IP']
+        env_headers = [
+            'HTTP_X_FORWARDED_FOR', 'HTTP_X_REAL_IP', 'HTTP_CF_CONNECTING_IP',
+            'HTTP_X_CLIENT_IP', 'REMOTE_ADDR', 'HTTP_CLIENT_IP'
+        ]
         for header in env_headers:
             env_ip = os.environ.get(header)
-            if env_ip and not env_ip.startswith('127.'):
-                return env_ip.split(',')[0].strip()
+            if env_ip and not env_ip.startswith('127.') and not env_ip.startswith('::1'):
+                ip = env_ip.split(',')[0].strip()
+                if ip and ip != 'unknown':
+                    return ip
         
-        # Method 3: Try to get external IP using a service (for production)
-        try:
-            import requests
-            import socket
+        # Method 3: Generate unique session identifier for tracking
+        # This gives each user session a unique "IP" for tracking purposes
+        if hasattr(st, 'session_state'):
+            if 'session_ip_id' not in st.session_state:
+                import hashlib
+                import time
+                import secrets
+                
+                # Create unique session identifier
+                session_data = f"{time.time()}_{secrets.token_hex(8)}"
+                hash_obj = hashlib.md5(session_data.encode())
+                hash_hex = hash_obj.hexdigest()
+                
+                # Convert to IP-like format for tracking
+                ip_parts = []
+                for i in range(0, 8, 2):
+                    part = int(hash_hex[i:i+2], 16) % 254 + 1
+                    ip_parts.append(str(part))
+                
+                # Use 10.x.x.x range for session tracking
+                session_ip = f"10.{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}"
+                st.session_state['session_ip_id'] = session_ip
             
-            # Quick check if we're likely in production (not localhost)
-            hostname = socket.gethostname()
-            local_ip = socket.gethostbyname(hostname)
-            
-            if not local_ip.startswith('127.') and not local_ip.startswith('192.168.'):
-                # We're likely in production, try to get external IP
-                response = requests.get('https://httpbin.org/ip', timeout=3)
-                if response.status_code == 200:
-                    external_ip = response.json().get('origin', '').split(',')[0].strip()
-                    if external_ip and not external_ip.startswith('127.'):
-                        return external_ip
-        except:
-            pass
+            return st.session_state['session_ip_id']
         
-        # Method 4: Try to get from socket (local network IP)
-        try:
-            import socket
-            # Connect to a remote address to get local IP
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            if local_ip and not local_ip.startswith('127.'):
-                return local_ip
-        except:
-            pass
-        
-        # Default fallback
+        # Fallback
         return "127.0.0.1"
+        
     except Exception as e:
         print(f"Error getting client IP: {e}")
         return "127.0.0.1"
+
+def set_manual_real_ip(ip_address):
+    """Set the real IP address manually (for production use)"""
+    if hasattr(st, 'session_state'):
+        st.session_state['manual_real_ip'] = ip_address
+        return True
+    return False
+
+def inject_real_ip_detector():
+    """Inject JavaScript to detect real client IP"""
+    try:
+        import streamlit.components.v1 as components
+        
+        js_code = """
+        <script>
+        async function detectRealIP() {
+            try {
+                const response = await fetch('https://api.ipify.org?format=json');
+                const data = await response.json();
+                const realIP = data.ip;
+                
+                if (realIP && realIP !== '127.0.0.1') {
+                    // Send back to Streamlit
+                    window.parent.postMessage({
+                        type: 'streamlit:setComponentValue',
+                        value: realIP
+                    }, '*');
+                }
+            } catch (error) {
+                // Fallback method
+                try {
+                    const response2 = await fetch('https://httpbin.org/ip');
+                    const data2 = await response2.json();
+                    const fallbackIP = data2.origin.split(',')[0].trim();
+                    
+                    window.parent.postMessage({
+                        type: 'streamlit:setComponentValue',
+                        value: fallbackIP
+                    }, '*');
+                } catch (error2) {
+                    window.parent.postMessage({
+                        type: 'streamlit:setComponentValue',
+                        value: 'detection_failed'
+                    }, '*');
+                }
+            }
+        }
+        
+        // Auto-run detection
+        detectRealIP();
+        </script>
+        """
+        
+        detected_ip = components.html(js_code, height=0)
+        
+        if detected_ip and detected_ip != 'detection_failed' and not detected_ip.startswith('127.'):
+            st.session_state['real_client_ip'] = detected_ip
+            return detected_ip
+            
+    except Exception as e:
+        print(f"Error in IP detection: {e}")
+    
+    return None
 
 def get_user_agent():
     """Get user agent from various sources"""
